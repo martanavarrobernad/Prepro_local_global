@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Feb  4 18:04:03 2026
+
+@author: navar
+"""
+
+import mne
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.interpolate import PchipInterpolator
+import gc
+import matplotlib.pyplot as plt # Importar matplotlib
+
+# ---- CONFIGURACIÓN ----
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg") # Asegúrate de que esta ruta sea correcta
+ESG_CERV = ["Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9", 
+            "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19", "SC6"]
+
+# Parámetros de detección automática
+# Estos valores pueden necesitar ajuste según la morfología específica de tus artefactos
+# y el nivel de ruido de tus datos.
+SEARCH_WIN_MS = (-2, 6)      # Ventana inicial de búsqueda del artefacto relativo al trigger
+THRESHOLD_MULTIPLIER = 4     # Un poco más sensible para detectar el inicio real
+END_THRESHOLD_FACTOR = 0.05  # MUCHO más bajo (5% del pico) para capturar toda la cola
+N_PAD = 12                   # Aumentamos a 12 para que la transición sea más suave
+# Matplotlib backend setup (para asegurar que los plots se generen sin interacción)
+try:
+    plt.switch_backend('Agg') # 'Agg' es para no mostrar las figuras, solo guardarlas
+except Exception:
+    pass
+
+# ==== 2) FUNCIONES ====
+
+def interpolate_stim_artifact(raw, onsets_sec, start_ms, end_ms, picks, n_pad=N_PAD):
+    """
+    Realiza la interpolación PCHIP en los datos brutos.
+    """
+    sf = raw.info["sfreq"]
+    data = raw._data  # Acceso directo a los datos para evitar copias
+    
+    # Asegúrate de que los picks existen en raw.ch_names
+    ch_indices = [raw.ch_names.index(ch) for ch in picks if ch in raw.ch_names]
+    
+    # Convertir ms a muestras
+    s0 = int(round(start_ms / 1000 * sf))
+    s1 = int(round(end_ms / 1000 * sf))
+    
+    for ons in onsets_sec:
+        idx_stim = int(round(ons * sf))
+        i0, i1 = idx_stim + s0, idx_stim + s1 # Ventana del artefacto
+        
+        # Asegurarse de que los límites estén dentro del rango de datos y permitan padding
+        if i0 - n_pad < 0 or i1 + n_pad >= data.shape[1]:
+            continue
+
+        # Puntos conocidos para la interpolación
+        x_known = np.concatenate([np.arange(i0 - n_pad, i0), 
+                                  np.arange(i1 + 1, i1 + 1 + n_pad)])
+        # Puntos a interpolar
+        x_interp = np.arange(i0, i1 + 1)
+
+        for ch in ch_indices:
+            y_known = data[ch, x_known]
+            f = PchipInterpolator(x_known, y_known)
+            data[ch, i0:i1 + 1] = f(x_interp).astype(np.float32) # Asegurar tipo float32
+
+def detect_artifact_window(raw, events, event_id, esg_chs):
+    """
+    Detecta automáticamente el inicio y fin del artefacto promediando.
+    Retorna la ventana en ms.
+    """
+    picks = [ch for ch in esg_chs if ch in raw.ch_names]
+    if not picks:
+        print("   Advertencia: No se encontraron canales ESG para la detección.")
+        return 0, 0 # Devuelve una ventana vacía o un error
+        
+    # Crear épocas de una ventana pequeña alrededor de los triggers
+    # Se usa tmin=0 para la detección, no para la limpieza.
+    epochs = mne.Epochs(raw, events, event_id=None, tmin=SEARCH_WIN_MS[0]/1000, 
+                        tmax=SEARCH_WIN_MS[1]/1000, picks=picks, baseline=(None, 0), 
+                        preload=True, verbose=False)
+    
+    if len(epochs) == 0:
+        print("   Advertencia: No se encontraron épocas válidas para la detección.")
+        return 0, 0
+
+    avg_evoked = epochs.average()
+    avg_data = avg_evoked.data.mean(axis=0) * 1e6 # Convertir a uV para detección
+    times_ms = avg_evoked.times * 1000
+
+    # Detección del inicio: busca un cambio brusco (por encima del umbral)
+    # después del tiempo 0 (onset del estímulo)
+    onset_idx = np.argmin(np.abs(times_ms - 0)) # Índice del estímulo
+    
+    # Calcula la desviación estándar de la línea base antes del estímulo
+    baseline_std = np.std(avg_data[times_ms < 0])
+    
+    # Encuentra el primer punto que excede el umbral después del estímulo
+    start_point = None
+    for i in range(onset_idx, len(avg_data)):
+        if np.abs(avg_data[i]) > THRESHOLD_MULTIPLIER * baseline_std:
+            start_point = times_ms[i]
+            break
+    
+    if start_point is None:
+        print("   No se detectó el inicio del artefacto por umbral. Usando estimación fija.")
+        start_point = 0.5 # Valor por defecto si no se detecta
+
+    # Detección del final: busca cuándo la amplitud cae a un porcentaje del pico máximo
+    # o de la amplitud inicial
+    peak_val_after_start = np.max(np.abs(avg_data[times_ms >= start_point]))
+    end_point = None
+    
+    # Busca el punto donde la amplitud vuelve a caer por debajo de un umbral
+    # (por ejemplo, el 20% del pico) después del pico.
+    # Se busca a partir del pico para asegurar que es la "cola" del artefacto
+    if peak_val_after_start > 0:
+        peak_idx_after_start = np.argmax(np.abs(avg_data[times_ms >= start_point])) + np.where(times_ms >= start_point)[0][0]
+        for i in range(peak_idx_after_start, len(avg_data)):
+            if np.abs(avg_data[i]) < END_THRESHOLD_FACTOR * peak_val_after_start:
+                end_point = times_ms[i]
+                break
+
+    if end_point is None:
+        print("   No se detectó el final del artefacto por umbral. Usando estimación fija.")
+        end_point = start_point + 4.0 # 4 ms de duración por defecto
+
+    # Asegurarse de que la ventana es válida
+    if end_point <= start_point:
+        end_point = start_point + 1.0 # Asegurar al menos 1ms de duración si hay problemas
+    
+    # Liberar memoria de épocas
+    del epochs, avg_evoked
+    gc.collect()
+
+    return start_point, end_point
+
+
+def plot_esg_comparison(t_ms, before_esg, after_esg, run_name):
+    """
+    Guarda un plot comparando los promedios ESG antes y después de la interpolación.
+    """
+    plt.ioff() # Desactivar modo interactivo
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(t_ms, before_esg * 1e6, color='gray', alpha=0.5, label='Original ESG Avg')
+    ax.plot(t_ms, after_esg * 1e6, color='blue', lw=1.5, label='Cleaned ESG Avg (PCHIP)')
+    ax.axvline(0, color='red', linestyle='--', label='Stimulus Onset') # Línea de estímulo
+    
+    ax.set_title(f"Verification - {run_name.replace('.vhdr','')}")
+    ax.set_xlabel("Time (ms)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.legend()
+    ax.grid(True, alpha=0.2)
+    
+    fig_path = SUBJECT_DIR / f"Cleaned_ESG_Verification_{run_name.replace('.vhdr','')}.png"
+    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+    plt.close(fig) # Cierra la figura para liberar memoria
+    print(f"   -> Imagen de verificación guardada: {fig_path.name}")
+
+# ==== 3) PROCESO PRINCIPAL ====
+
+def main():
+    vhdr_files = sorted([f for f in SUBJECT_DIR.glob("*.vhdr") 
+                         if "Run" in f.name and "Rest" not in f.name and "NoStim" not in f.name and "Clean_Auto" not in f.name])
+    
+    if not vhdr_files:
+        print(f"No se encontraron archivos .vhdr con 'Run' en {SUBJECT_DIR}. Asegúrate de que la ruta es correcta o que los archivos existen.")
+        return
+
+    results = []
+
+    for vhdr in vhdr_files:
+        print(f"\n>>> Procesando automáticamente: {vhdr.name}")
+        
+        # Paso 1: Cargar y preparar datos
+        raw = mne.io.read_raw_brainvision(vhdr, preload=True, verbose=False)
+        raw._data = raw._data.astype(np.float32) # Forzar float32 para ahorrar RAM
+        
+        events, event_id = mne.events_from_annotations(raw, verbose=False)
+        stim_codes = [v for k, v in event_id.items() if "Stimulus/S" in k]
+        
+        # Canales a limpiar (todos menos estímulo/misc)
+        ch_to_clean = [ch for ch in raw.ch_names if raw.get_channel_types()[raw.ch_names.index(ch)] not in ('stim', 'misc')]
+        esg_present = [ch for ch in ESG_CERV if ch in raw.ch_names]
+
+        if not esg_present:
+            print(f"   No se encontraron canales ESG en {vhdr.name}. Saltando.")
+            del raw
+            gc.collect()
+            continue
+        
+        # Promedio antes de limpiar (para la foto)
+        # Usamos una ventana ligeramente más grande para la visualización
+        epochs_plot_tmin, epochs_plot_tmax = -0.01, 0.02 # -10ms a +20ms
+        epochs_before = mne.Epochs(raw, events, event_id=None, tmin=epochs_plot_tmin, tmax=epochs_plot_tmax, 
+                                   picks=esg_present, baseline=(None, 0), preload=True, verbose=False)
+        
+        if len(epochs_before) == 0:
+            print(f"   No se encontraron épocas para visualización en {vhdr.name}. Saltando.")
+            del raw, epochs_before
+            gc.collect()
+            continue
+
+        before_avg = epochs_before.average().data.mean(axis=0)
+        t_ms_plot = epochs_before.times * 1000
+        
+        # 2. DETECCIÓN AUTOMÁTICA DE LA VENTANA DEL ARTEFACTO
+        start_ms, end_ms = detect_artifact_window(raw, events, event_id, esg_present)
+        print(f"   Ventana detectada para interpolación: {start_ms:.2f}ms a {end_ms:.2f}ms")
+        
+        # 3. INTERPOLACIÓN (PCHIP) en todos los onsets de estímulo
+        onsets_sec = events[np.isin(events[:, 2], stim_codes)][:, 0] / raw.info["sfreq"]
+        print(f"   Interpolando {len(onsets_sec)} artefactos...")
+        interpolate_stim_artifact(raw, onsets_sec, start_ms, end_ms, ch_to_clean, N_PAD)
+
+        # 4. Promedio después de limpiar (para la foto)
+        # Es necesario crear nuevas épocas ya que `raw._data` ha sido modificado in-place
+        epochs_after = mne.Epochs(raw, events, event_id=None, tmin=epochs_plot_tmin, tmax=epochs_plot_tmax, 
+                                  picks=esg_present, baseline=(None, 0), preload=True, verbose=False)
+        after_avg = epochs_after.average().data.mean(axis=0)
+
+        # 5. Guardar IMAGEN DE VERIFICACIÓN
+        plot_esg_comparison(t_ms_plot, before_avg, after_avg, vhdr.name)
+        
+        # 6. EXPORTAR datos limpios
+        out_vhdr = SUBJECT_DIR / f"{vhdr.stem}_Clean_Auto.vhdr"
+        mne.export.export_raw(out_vhdr, raw, fmt="brainvision", overwrite=True)
+        print(f"   -> Archivo limpio guardado: {out_vhdr.name}")
+        
+        results.append({"run": vhdr.name, "start_ms": start_ms, "end_ms": end_ms})
+        
+        # 7. LIBERAR MEMORIA
+        print("   Liberando memoria...")
+        del raw, epochs_before, epochs_after, before_avg, after_avg
+        gc.collect()
+
+    # Guardar log de tiempos detectados
+    if results:
+        df_results = pd.DataFrame(results)
+        df_results.to_csv(SUBJECT_DIR / "tiempos_auto_detectados.csv", index=False, float_format="%.2f")
+        print(f"\nResumen de ventanas detectadas guardado en: {SUBJECT_DIR / 'tiempos_auto_detectados.csv'}")
+
+    print("\n¡Proceso de automatización completado con éxito!")
+
+if __name__ == "__main__":
+    main()
