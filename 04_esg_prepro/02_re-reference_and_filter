@@ -1,0 +1,55 @@
+# -*- coding: utf-8 -*-
+"""
+PASO 1: RE-REFERENCIA Y FILTRADO (Protocolo Gabrieli et al.)
+- Carga archivos interpolados (PCHIP).
+- Re-referencia a TH6.
+- Filtro 50-800 Hz.
+"""
+
+from pathlib import Path
+import mne
+import gc
+
+# ==== CONFIGURACIÓN ====
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg")
+# Cargamos los archivos que ya limpiamos con PCHIP
+RUN_FILES = list(SUBJECT_DIR.glob("*_ESG_Cleaned.vhdr"))
+
+ESG_CHANNELS = [
+    'Iz', 'SC1', 'SC6', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 
+    'S11', 'S12', 'S13', 'S14', 'S15', 'S16', 'S17', 'S18', 'S19'
+]
+REF_CHANNEL = ['TH6']
+
+def main():
+    for f_path in RUN_FILES:
+        print(f"\n--- Procesando: {f_path.name} ---")
+        
+        # 1. Cargar datos
+        raw = mne.io.read_raw_brainvision(f_path, preload=True, verbose=False)
+        
+        # 2. RE-REFERENCIA A TH6
+        # Es fundamental hacerlo antes del filtro para no propagar ruidos de fase
+        if 'TH6' in raw.ch_names:
+            print(f"  -> Re-referenciando a {REF_CHANNEL}...")
+            raw.set_eeg_reference(ref_channels=REF_CHANNEL, verbose=False)
+        else:
+            print(f"  ⚠️ No se encontró {REF_CHANNEL} en este archivo.")
+
+        # 3. FILTRADO (Protocolo Gabrieli: 50-800 Hz)
+        # Este filtro ya va a empezar a atenuar el ECG antes de detectar los R-peaks
+        print("  -> Aplicando filtro 50-800 Hz...")
+        raw.filter(l_freq=50.0, h_freq=800.0, fir_design='firwin', phase='zero', verbose=False)
+        
+        # 4. GUARDAR ESTADO INTERMEDIO
+        # Guardamos con un sufijo nuevo para que tu siguiente script (R-peaks) lo tome de aquí
+        out_name = SUBJECT_DIR / f"{f_path.stem}_RefTH6_Filt.fif"
+        raw.save(out_name, overwrite=True, verbose=False)
+        
+        print(f"  ✅ Guardado: {out_name.name}")
+        
+        del raw
+        gc.collect()
+
+if __name__ == "__main__":
+    main()
