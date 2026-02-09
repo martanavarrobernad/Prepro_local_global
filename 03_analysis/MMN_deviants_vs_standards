@@ -1,0 +1,81 @@
+# -*- coding: utf-8 -*-
+import mne
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from pathlib import Path
+
+# 1. CARGA
+FILE_PATH = Path(r"C:\Users\navar\Desktop\eeg\eeg\sub-001_8COND_LIMPIO_epo.fif")
+epochs = mne.read_epochs(FILE_PATH, preload=True)
+
+# ROI Local (NICE) - Fronto-central
+ROI_LOCAL = ['Fz', 'FCz', 'Cz', 'F1', 'F2', 'FC1', 'FC2']
+valid_roi = [ch for ch in ROI_LOCAL if ch in epochs.ch_names]
+
+# 2. COLAPSO TOTAL (LD vs LS)
+ld_all = [c for c in epochs.event_id if 'LD' in c]
+ls_all = [c for c in epochs.event_id if 'LS' in c]
+
+# Evocados para el Topoplot
+ev_ld = epochs[ld_all].average()
+ev_ls = epochs[ls_all].average()
+mmn_diff = mne.combine_evoked([ev_ld, ev_ls], weights=[1, -1])
+
+# 3. ESTADÍSTICA TRIAL A TRIAL (En la ROI)
+data_ld = epochs[ld_all].get_data(picks=valid_roi).mean(axis=1)
+data_ls = epochs[ls_all].get_data(picks=valid_roi).mean(axis=1)
+t_stats, p_vals = stats.ttest_ind(data_ld, data_ls, axis=0, equal_var=False)
+
+# 4. ENCONTRAR EL PICO DE NEGATIVIDAD (Entre 100 y 250ms)
+# Buscamos el mínimo en el promedio de la ROI
+mmn_roi_trace = mmn_diff.copy().pick(valid_roi).data.mean(axis=0)
+mask_window = (mmn_diff.times >= 0.100) & (mmn_diff.times <= 0.250)
+peak_idx = np.argmin(mmn_roi_trace[mask_window])
+peak_time = mmn_diff.times[mask_window][peak_idx]
+
+print(f"Pico de MMN detectado a los {peak_time*1000:.1f} ms")
+
+# 5. GRÁFICA COMBINADA
+fig = plt.figure(figsize=(14, 7))
+ax_erp = plt.subplot2grid((1, 3), (0, 0), colspan=2)
+ax_topo = plt.subplot2grid((1, 3), (0, 2))
+
+# --- PANEL ERP ---
+times = epochs.times * 1000
+mean_ld = np.mean(data_ld, axis=0) * 1e6
+mean_ls = np.mean(data_ls, axis=0) * 1e6
+
+ax_erp.plot(times, mean_ls, color='black', lw=1.5, label='Local Standard (All LS)')
+ax_erp.plot(times, mean_ld, color='red', lw=2, label='Local Deviant (All LD)')
+
+# Barras de significancia
+ax_erp.fill_between(times, -4.5, -4.2, where=(p_vals < 0.05), color='gray', alpha=0.5, label='p < 0.05')
+ax_erp.fill_between(times, -4.8, -4.5, where=(p_vals < 0.01), color='red', alpha=0.8, label='p < 0.01')
+
+# Marcador del pico
+ax_erp.axvline(peak_time*1000, color='blue', ls='--', alpha=0.4, label=f'Peak: {int(peak_time*1000)}ms')
+
+ax_erp.set_title("Efecto Local (MMN) - ROI Fronto-Central", fontweight='bold')
+ax_erp.set_ylabel("Voltaje (µV)")
+ax_erp.set_xlabel("Tiempo (ms)")
+ax_erp.set_ylim(-5.5, 7)
+ax_erp.legend(loc='upper right', fontsize='small')
+ax_erp.grid(True, alpha=0.2)
+# --- PANEL TOPOPLOT (CORREGIDO) ---
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+# Creamos un divisor para el eje del topoplot
+divider = make_axes_locatable(ax_topo)
+# Creamos un eje nuevo a la derecha para la colorbar (5% de ancho)
+ax_colorbar = divider.append_axes("right", size="5%", pad=0.05)
+
+# Graficamos el topomap pasando AMBOS ejes
+mmn_diff.plot_topomap(times=peak_time, axes=[ax_topo, ax_colorbar], 
+                      colorbar=True, show=False, cmap='RdBu_r', 
+                      vlim=(-2, 2), contours=0)
+
+ax_topo.set_title(f"Distribución @ {int(peak_time*1000)}ms", fontsize=10)
+
+plt.tight_layout()
+plt.show()
