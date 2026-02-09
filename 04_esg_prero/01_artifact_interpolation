@@ -1,0 +1,133 @@
+# -*- coding: utf-8 -*-
+"""
+Script Completo de Interpolación PCHIP - ESG & ENG
+Incluye:
+- Selección de 25 canales específicos (Espinales + Periféricos).
+- Generación de gráficos de verificación (Check_CLEAN_...).
+- Exportación a BrainVision (.vhdr).
+- Gestión de memoria float32.
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import mne
+import matplotlib.pyplot as plt
+from scipy.interpolate import PchipInterpolator
+import gc
+
+# ==== 1) CONFIGURACIÓN DE RUTAS Y CANALES ====
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg")
+CFG_WIN_CSV = SUBJECT_DIR / "tiempos_artefacto_ESG_MULTICONS.csv"
+
+# Canales a limpiar (ESG + ENG)
+CHANNELS_TO_CLEAN = [
+    'Iz', 'SC1', 'SC6', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S9', 
+    'S11', 'S12', 'S13', 'S14', 'S15', 'S16', 'S17', 'S18', 'S19', 
+    'AC', 'TH6', 'ENG_AXILLA', 'ENG_AXILLA_REF', 'ENG_ERB', 'ENG_ERB_REF'
+]
+
+N_PAD = 5 # Puntos extra para suavizar la unión del PCHIP
+
+# ==== 2) FUNCIÓN DE INTERPOLACIÓN ====
+def interpolate_stim_artifact(raw, onsets_sec, start_ms, end_ms, picks, n_pad=5):
+    sf = raw.info["sfreq"]
+    data = raw._data 
+    ch_indices = [raw.ch_names.index(ch) for ch in picks if ch in raw.ch_names]
+    
+    # Ventana en muestras
+    s0 = int(round(start_ms / 1000 * sf))
+    s1 = int(round(end_ms / 1000 * sf))
+    
+    for ons in onsets_sec:
+        idx_stim = int(round(ons * sf))
+        i0, i1 = idx_stim + s0, idx_stim + s1
+        
+        if i0 - n_pad < 0 or i1 + n_pad >= data.shape[1]:
+            continue
+
+        # Puntos de apoyo (antes y después del artefacto)
+        x_known = np.concatenate([np.arange(i0 - n_pad, i0), 
+                                  np.arange(i1 + 1, i1 + 1 + n_pad)])
+        x_interp = np.arange(i0, i1 + 1)
+
+        for ch in ch_indices:
+            y_known = data[ch, x_known]
+            f = PchipInterpolator(x_known, y_known)
+            data[ch, i0:i1 + 1] = f(x_interp)
+
+# ==== 3) PROCESO PRINCIPAL ====
+def main():
+    if not CFG_WIN_CSV.exists():
+        print(f"No se encuentra el CSV: {CFG_WIN_CSV}")
+        return
+
+    df_win = pd.read_csv(CFG_WIN_CSV)
+    
+    for _, row in df_win.iterrows():
+        vhdr_path = SUBJECT_DIR / str(row['run']).strip()
+        if not vhdr_path.exists():
+            print(f"Archivo no encontrado: {vhdr_path.name}")
+            continue
+        
+        print(f"\n--- PROCESANDO: {vhdr_path.name} ---")
+        
+        # Carga con preload=True para poder modificar los datos
+        raw = mne.io.read_raw_brainvision(vhdr_path, preload=True, verbose=False)
+        
+        # Pasamos a float32 para ahorrar RAM
+        raw._data = raw._data.astype(np.float32)
+        gc.collect()
+        
+        # Filtrar canales presentes
+        picks = [ch for ch in CHANNELS_TO_CLEAN if ch in raw.ch_names]
+        
+        # Obtener Triggers (estimulaciones)
+        events, event_id = mne.events_from_annotations(raw, verbose=False)
+        stim_codes = [v for k, v in event_id.items() if "Stimulus" in k]
+        onsets = events[np.isin(events[:, 2], stim_codes)][:, 0] / raw.info["sfreq"]
+
+        if len(onsets) == 0:
+            print("  ⚠️ Sin triggers detectados.")
+            continue
+
+        # Control de calidad: Promedio ANTES de limpiar
+        epochs = mne.Epochs(raw, events, event_id=None, tmin=-0.005, tmax=0.015, 
+                            picks=picks, baseline=None, preload=True, verbose=False)
+        before_avg = epochs.average().data.mean(axis=0)
+        t_ms = epochs.times * 1000
+
+        # --- EJECUTAR PCHIP ---
+        print(f"  -> Limpiando {len(onsets)} disparos en {len(picks)} canales...")
+        interpolate_stim_artifact(raw, onsets, row['start_ms'], row['end_ms'], picks, N_PAD)
+
+        # Control de calidad: Promedio DESPUÉS de limpiar
+        epochs_after = mne.Epochs(raw, events, event_id=None, tmin=-0.005, tmax=0.015, 
+                                  picks=picks, baseline=None, preload=True, verbose=False)
+        after_avg = epochs_after.average().data.mean(axis=0)
+
+        # Generar y guardar la imagen de verificación
+        plt.ioff() # No mostrar ventana emergente
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(t_ms, before_avg * 1e6, color='gray', alpha=0.5, label='Original')
+        ax.plot(t_ms, after_avg * 1e6, color='blue', lw=1.2, label='PCHIP Clean')
+        ax.set_title(f"Verificación: {vhdr_path.name}")
+        ax.set_xlabel("ms")
+        ax.set_ylabel("µV")
+        ax.legend()
+        fig.savefig(SUBJECT_DIR / f"Check_CLEAN_{vhdr_path.stem}.png")
+        plt.close(fig)
+        
+        # Exportar a formato BrainVision
+        out_name = SUBJECT_DIR / f"{vhdr_path.stem}_ESG_Cleaned.vhdr"
+        print(f"  -> Exportando {out_name.name}...")
+        mne.export.export_raw(out_name, raw, fmt="brainvision", overwrite=True)
+        
+        # Limpiar RAM
+        del raw, epochs, epochs_after
+        gc.collect()
+
+    print("\n✅ ¡LISTO! Proceso finalizado.")
+
+if __name__ == "__main__":
+    main()
