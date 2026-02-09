@@ -1,0 +1,206 @@
+# -*- coding: utf-8 -*-
+"""
+STEP 4: SCRIPT FINAL - FLUJO COMPLETO Y CORRECTO
+------------------------------------------------
+1. Carga (Interpolando canales malos del CSV).
+2. Proceso (Eliminando 25 primeros trials de habituación).
+3. ICA Visual: Líneas -> Cabezas -> Overlay (Comprobación).
+4. Limpieza final de Epochs.
+"""
+
+import matplotlib
+try:
+    matplotlib.use('Qt5Agg') # Intenta usar ventana flotante
+except:
+    pass
+
+import mne
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import gc
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# 1. CONFIGURACIÓN
+# =============================================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg")
+CSV_PATH = SUBJECT_DIR / "bad_channels_registry.csv"
+GLOBAL_ICA_PATH = SUBJECT_DIR / "GLOBAL_ica.fif"
+DATA_SUFFIX = "_Step2_Inspected.vhdr" 
+OUTPUT_FILENAME = "sub-001_FINAL_concatenated_epo.fif"
+
+L_FREQ, H_FREQ = 0.1, 30.0    
+TMIN, TMAX = -0.2, 0.8        
+MONTAJE_GORRO = 'easycap-M1'
+
+TRIGGER_MAP = {
+    # === SESIÓN ATTENTIVE (Contar Sonidos) ===
+    '69':  'LSGS_ATT', '133': 'LSGS_ATT',  # Local Std, Global Std
+    '149': 'LSGD_ATT', '85':  'LSGD_ATT',  # Local Std, Global Dev
+    '141': 'LDGS_ATT', '77':  'LDGS_ATT',  # Local Dev, Global Std
+    '157': 'LDGD_ATT', '93':  'LDGD_ATT',  # Local Dev, Global Dev
+
+    # === SESIÓN INATTENTIVE (Contar Letras) ===
+    '101': 'LSGS_INAT', '165': 'LSGS_INAT', 
+    '181': 'LSGD_INAT', '117': 'LSGD_INAT', 
+    '173': 'LDGS_INAT', '109': 'LDGS_INAT', 
+    '189': 'LDGD_INAT', '125': 'LDGD_INAT'
+}
+
+# IDs numéricos únicos para MNE
+EVENT_ID = {
+    'LSGS_ATT': 10, 'LSGD_ATT': 11, 'LDGS_ATT': 12, 'LDGD_ATT': 13,
+    'LSGS_INAT': 20, 'LSGD_INAT': 21, 'LDGS_INAT': 22, 'LDGD_INAT': 23
+}
+
+EXPECTED_EEG = [
+    'Fp1', 'Fz', 'F3', 'F7', 'FT9', 'FC5', 'FC1', 'C3', 'T7', 'TP9', 
+    'CP5', 'CP1', 'Pz', 'P3', 'P7', 'O1', 'Oz', 'O2', 'P4', 'P8', 
+    'TP10', 'CP6', 'CP2', 'C4', 'T8', 'FT10', 'FC6', 'FC2', 'F4', 
+    'F8', 'Fp2', 'AF7', 'AF3', 'AFz', 'F1', 'F5', 'FT7', 'FC3', 
+    'C1', 'C5', 'TP7', 'CP3', 'P1', 'P5', 'PO7', 'PO3', 'POz', 
+    'PO4', 'PO8', 'P6', 'P2', 'CPz', 'CP4', 'TP8', 'C6', 'C2', 
+    'FC4', 'FT8', 'F6', 'AF8', 'AF4', 'F2', 'FCz', 'Cz'
+]
+
+# =============================================================================
+# FUNCIONES
+# =============================================================================
+def get_bads_from_csv(filename, df_bads):
+    base_name = filename.replace(DATA_SUFFIX, "")
+    row = df_bads[df_bads['run'].str.contains(base_name, regex=False)]
+    if not row.empty:
+        bads_str = str(row['bad_channels'].iloc[0])
+        if bads_str and bads_str.lower() != 'nan':
+            return [ch.strip() for ch in bads_str.split(',') if ch.strip()]
+    return []
+
+# =============================================================================
+# 2. CARGA Y PROCESAMIENTO (HABITUACIÓN + INTERPOLACIÓN)
+# =============================================================================
+if not CSV_PATH.exists(): raise FileNotFoundError("Falta CSV bad channels.")
+if not GLOBAL_ICA_PATH.exists(): raise FileNotFoundError("Falta GLOBAL_ica.fif")
+
+df_bads = pd.read_csv(CSV_PATH)
+files = sorted(list(SUBJECT_DIR.glob(f"*{DATA_SUFFIX}")))
+
+print(f"--- INICIO: CARGANDO {len(files)} ARCHIVOS ---")
+
+raw_list = []
+events_list = []
+
+for f_path in files:
+    raw_tmp = mne.io.read_raw_brainvision(f_path, preload=True, verbose=False)
+    
+    # A. Canales
+    ch_map = {ch: 'eeg' if ch in EXPECTED_EEG else 'eog' if ch in ['VEOG', 'HEOG'] else 'misc' for ch in raw_tmp.ch_names}
+    if 'ECG' in raw_tmp.ch_names: ch_map['ECG'] = 'ecg'
+    raw_tmp.set_channel_types(ch_map)
+    raw_tmp.set_montage(mne.channels.make_standard_montage(MONTAJE_GORRO), on_missing='ignore')
+    
+    # B. Interpolación
+    bads_csv = get_bads_from_csv(f_path.name, df_bads)
+    total_bads = list(set(raw_tmp.info['bads'] + bads_csv))
+    raw_tmp.info['bads'] = total_bads
+    if total_bads:
+        raw_tmp.interpolate_bads(reset_bads=True, verbose=False, method='spline')
+
+    raw_tmp.set_eeg_reference('average', projection=False, verbose=False)
+    
+    # C. Eventos y Habituación (CORREGIDO PARA BEAT 5)
+    events, event_id_map = mne.events_from_annotations(raw_tmp, verbose=False)
+    id_to_code = {v: k.replace('Stimulus/S', '').strip() for k, v in event_id_map.items()}
+    
+    clean_events = []
+    trial_count = 0  
+    final_codes = list(TRIGGER_MAP.keys())
+
+    for ev in events:
+        code = str(id_to_code.get(ev[2]))
+        
+        if code in final_codes:
+            trial_count += 1
+            if trial_count > 25: 
+                label = TRIGGER_MAP[code]
+                # Creamos el evento con el nuevo ID de 8 condiciones
+                clean_events.append([ev[0], 0, EVENT_ID[label]])
+
+    print(f"-> {f_path.name}: habituación eliminada. {len(clean_events)} trials de test.")
+    raw_list.append(raw_tmp)
+    events_list.append(np.array(clean_events) if clean_events else np.zeros((0,3), dtype=int))
+
+# D. Concatenación (SINCRONIZADA)
+print("Concatenando...")
+first_samps = [r.first_samp for r in raw_list]
+last_samps = [r.last_samp for r in raw_list]
+raw_global = mne.concatenate_raws(raw_list)
+# Esta función es clave para que los tiempos de eventos no se rompan al unir archivos
+events_global = mne.concatenate_events(events_list, first_samps, last_samps)
+
+del raw_list
+gc.collect()
+
+# =============================================================================
+# 3. ICA: EL FLUJO COMPLETO (Lines -> Topo -> Overlay)
+# =============================================================================
+print("\n[PROCESO] Cargando ICA...")
+ica = mne.preprocessing.read_ica(GLOBAL_ICA_PATH, verbose=False)
+ica.exclude = [] 
+
+while True:
+    print("\n" + "="*60)
+    print("   SELECCIÓN DE ICA")
+    print("   1. LINEAS: Busca qué componente salta con VEOG.")
+    print("   2. CABEZAS: Haz clic en ese componente para borrarlo.")
+    print("   3. OVERLAY: Comprueba si la línea ROJA (limpia) aplana el pico.")
+    print("="*60)
+    
+    # PASO 1: LÍNEAS
+    ica.plot_sources(raw_global, show_scrollbars=False, title="1. LINEAS: BUSCA EL PARPADEO")
+    plt.show(block=True) 
+
+    # PASO 2: CABEZAS (SELECCIÓN)
+    ica.plot_components(inst=raw_global, title="2. CABEZAS: CLIC PARA BORRAR")
+    plt.show(block=True)
+    
+    if not ica.exclude:
+        print("⚠️ No has seleccionado nada. Vuelve a intentarlo.")
+        continue
+
+    # PASO 3: OVERLAY (COMPROBACIÓN)
+    print("\n   >>> Generando Overlay...")
+    ica.plot_overlay(raw_global, exclude=ica.exclude, show=False, title="3. OVERLAY (Rojo debe ser plano)")
+    plt.show(block=True)
+    
+    ans = input(f"\n>>> Has borrado {ica.exclude}. ¿La línea ROJA se ve mejor (plana)? (s/n): ")
+    
+    if ans.lower() == 's':
+        print("Perfecto. Aplicando.")
+        break
+    else:
+        print("Reiniciando selección...")
+        ica.exclude = [] 
+
+# =============================================================================
+# 4. FINAL: APLICAR Y LIMPIAR EPOCHS
+# =============================================================================
+print("\n[PROCESO] Aplicando ICA y Filtrando...")
+ica.apply(raw_global)
+raw_global.filter(L_FREQ, H_FREQ, verbose=False)
+
+print("[PROCESO] Creando Epochs...")
+epochs = mne.Epochs(raw_global, events_global, event_id=EVENT_ID,
+                    tmin=TMIN, tmax=TMAX, baseline=(TMIN, 0), preload=True, verbose=False)
+
+print("\n" + "!"*60)
+print("   4. LIMPIEZA FINAL DE EPOCHS")
+print("   Haz clic en los trials feos para borrarlos y cierra.")
+print("!"*60)
+
+epochs.plot(n_epochs=5, n_channels=len(EXPECTED_EEG), scalings='auto', title="4. LIMPIEZA MANUAL FINAL")
+plt.show(block=True)
+
+out_file = SUBJECT_DIR / OUTPUT_FILENAME
+epochs.save(out_file, overwrite=True)
+print(f"\n✅ GUARDADO: {out_file.name}")
