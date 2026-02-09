@@ -1,19 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Feb  3 16:55:00 2026
+Created on Thu Feb  5 16:36:01 2026
+
 @author: navar
-Batch Preprocessing for 8 Runs: Downsample and Cz recovery ONLY.
+"""
+
+# -*- coding: utf-8 -*-
+"""
+STEP 1: PREPARATION (Downsample + Cz + Montage)
+-----------------------------------------------
+Objetivo: Preparar la estructura de datos para la inspección.
+Input: Archivos crudos (o con artefacto de estimulación quitado).
+Output: Archivos *_Step1_Prep.vhdr (Listos para inspección).
+
+IMPORTANTE: 
+- NO aplica filtros todavía.
+- NO aplica Referencia Promedio todavía (para evitar contaminación).
+- Cz será una línea plana (0).
 """
 
 import mne
 import gc
 from pathlib import Path
 
-# --- CONFIGURACIÓN ---
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+# 1. Rutas
 SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg")
-target_sfreq = 250.0 
 
-EEG_CHANNELS = [
+# 2. Qué archivos buscar (Input)
+# Si tus archivos de entrada terminan en "_NoStimArtifact.vhdr", déjalo así.
+# Si son los crudos originales, pon solo ".vhdr".
+INPUT_SUFFIX = "_NoStimArtifact.vhdr" 
+
+# 3. Parámetros
+TARGET_SFREQ = 250.0  # Hz
+
+# 4. Lista de Canales (Tu lista personalizada)
+EEG_CHANNELS_LIST = [
     'Fp1', 'Fz', 'F3', 'F7', 'FT9', 'FC5', 'FC1', 'C3', 'T7', 'TP9', 
     'CP5', 'CP1', 'Pz', 'P3', 'P7', 'O1', 'Oz', 'O2', 'P4', 'P8', 
     'TP10', 'CP6', 'CP2', 'C4', 'T8', 'FT10', 'FC6', 'FC2', 'F4', 
@@ -23,49 +48,79 @@ EEG_CHANNELS = [
     'FC4', 'FT8', 'F6', 'AF8', 'AF4', 'F2', 'FCz'
 ]
 
-# Buscamos los archivos NoStimArtifact generados previamente
-vhdr_files = sorted(list(SUBJECT_DIR.glob("*_NoStimArtifact.vhdr")))
+# =============================================================================
+# EJECUCIÓN
+# =============================================================================
+# Buscamos archivos
+vhdr_files = sorted(list(SUBJECT_DIR.glob(f"*{INPUT_SUFFIX}")))
 
-# --- BUCLE DE PROCESAMIENTO ---
+if not vhdr_files:
+    print(f"ERROR: No se encontraron archivos con terminación '{INPUT_SUFFIX}' en:")
+    print(f"   {SUBJECT_DIR}")
+else:
+    print(f"Encontrados {len(vhdr_files)} archivos para procesar.")
+
 for vhdr_file in vhdr_files:
-    print(f"\nProcesando: {vhdr_file.name}")
+    print(f"\nProcessing: {vhdr_file.name} ...")
     
-    # Cargar datos
+    # 1. CARGAR
+    # 'misc' para canales que no sabemos qué son, luego los definimos bien
     raw = mne.io.read_raw_brainvision(vhdr_file, preload=True)
     
-    # 1. Downsampling
-    raw.resample(target_sfreq)
+    # 2. DOWNSAMPLE (Ahorra memoria y cálculo)
+    if raw.info['sfreq'] != TARGET_SFREQ:
+        print(f"   -> Resampling de {raw.info['sfreq']}Hz a {TARGET_SFREQ}Hz")
+        raw.resample(TARGET_SFREQ)
     
-    # 2. Clasificación de canales
+    # 3. DEFINIR TIPOS DE CANAL
+    # Primero ponemos todos como 'misc' para evitar errores, luego definimos EEG/EOG
+    raw.set_channel_types({ch: 'misc' for ch in raw.ch_names})
+    
     ch_types = {}
     for ch in raw.ch_names:
         if ch in ['VEOG', 'HEOG']:
             ch_types[ch] = 'eog'
         elif ch == 'ECG':
             ch_types[ch] = 'ecg'
-        elif ch in EEG_CHANNELS:
+        elif ch in EEG_CHANNELS_LIST:
             ch_types[ch] = 'eeg'
-        else:
-            ch_types[ch] = 'misc'
-    raw.set_channel_types(ch_types)
     
-    # 3. Recuperar Cz y Montaje (CORRECCIÓN CZ)
-    # Añadimos Cz antes del montaje para que MNE le asigne su posición
-    raw = mne.add_reference_channels(raw, ref_channels=['Cz'])
+    # Aplicamos el diccionario de tipos
+    # (Solo aplicamos a los que existen en el archivo para no dar error)
+    final_types = {k: v for k, v in ch_types.items() if k in raw.ch_names}
+    raw.set_channel_types(final_types)
+    
+    # 4. RECUPERAR Cz Y APLICAR MONTAJE 3D
+    # Añadimos Cz (se crea con valor 0)
+    if 'Cz' not in raw.ch_names:
+        print("   -> Añadiendo canal de referencia 'Cz' (Flat line)")
+        raw = mne.add_reference_channels(raw, ref_channels=['Cz'])
+        # Aseguramos que Cz también sea tipo EEG
+        raw.set_channel_types({'Cz': 'eeg'})
+    
+    # Montaje (Geometría de los electrodos)
+    print("   -> Aplicando montaje estándar (easycap-M1)")
     montage = mne.channels.make_standard_montage('easycap-M1')
-    raw.set_montage(montage, on_missing='ignore')
+    raw.set_montage(montage, on_missing='warn') # 'warn' nos avisa si falta alguno raro
     
-    # 4. Re-referencia promedio
-    raw.set_eeg_reference(ref_channels='average')
+    # NOTA CRÍTICA: NO HACEMOS set_eeg_reference('average') AQUÍ.
+    #    Esperamos a limpiar los canales malos en los siguientes pasos.
+
+    # 5. GUARDAR
+    # El nombre será: "sub-001_run-01_Step1_Prep.vhdr"
+    out_name = SUBJECT_DIR / f"{vhdr_file.stem.replace(INPUT_SUFFIX.split('.')[0], '')}_Step1_Prep.vhdr"
     
-    # 5. GUARDAR EL RESULTADO
-    out_name = SUBJECT_DIR / f"{vhdr_file.stem}_Preprocessed.vhdr"
+    # Si el nombre queda raro por el replace, usamos este método más simple:
+    # out_name = SUBJECT_DIR / f"{vhdr_file.stem}_Step1_Prep.vhdr"
+    
     mne.export.export_raw(out_name, raw, fmt="brainvision", overwrite=True)
+    print(f"   ✓ Guardado: {out_name.name}")
     
-    print(f"✓ Finalizado y guardado: {out_name.name}")
-    
-    # Limpiar memoria
+    # Limpieza RAM
     del raw
     gc.collect()
 
-print("\nProcesamiento de los 8 runs completado.")
+print("\n" + "="*50)
+print("PASO 1 COMPLETADO EXITOSAMENTE")
+print("Siguiente paso: Inspección Visual y Marcado de Artefactos.")
+print("="*50)
