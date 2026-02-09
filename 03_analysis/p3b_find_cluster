@@ -1,0 +1,49 @@
+# -*- coding: utf-8 -*-
+import mne
+import numpy as np
+from scipy import stats
+
+# 1. TU LISTA OFICIAL DE CANALES EEG
+eeg_list = [
+    'Fp1', 'Fz', 'F3', 'F7', 'FT9', 'FC5', 'FC1', 'C3', 'T7', 'TP9', 
+    'CP5', 'CP1', 'Pz', 'P3', 'P7', 'O1', 'Oz', 'O2', 'P4', 'P8', 
+    'TP10', 'CP6', 'CP2', 'C4', 'T8', 'FT10', 'FC6', 'FC2', 'F4', 'F8', 
+    'Fp2', 'AF7', 'AF3', 'AFz', 'F1', 'F5', 'FT7', 'FC3', 'C1', 'C5', 
+    'TP7', 'CP3', 'P1', 'P5', 'PO7', 'PO3', 'POz', 'PO4', 'PO8', 'P6', 
+    'P2', 'CPz', 'CP4', 'TP8', 'C6', 'C2', 'FC4', 'FT8', 'F6', 'AF8', 
+    'AF4', 'F2', 'FCz', 'Cz'
+]
+
+# 2. CARGA
+epochs = mne.read_epochs(r"C:\Users\navar\Desktop\eeg\eeg\sub-001_8COND_LIMPIO_epo.fif", preload=True)
+
+# 3. FILTRADO: Solo canales que estén en tu lista y en el archivo
+valid_eeg = [ch for ch in eeg_list if ch in epochs.ch_names]
+ep_eeg = epochs.copy().pick(valid_eeg)
+
+# 4. IDENTIFICAR CONDICIONES GLOBALES
+gd_att = [c for c in ep_eeg.event_id if 'GD_ATT' in c]
+gd_inat = [c for c in ep_eeg.event_id if 'GD_INAT' in c]
+
+# 5. ANÁLISIS 300-500ms
+# Cortamos la ventana de interés
+ep_crop = ep_eeg.copy().crop(tmin=0.300, tmax=0.500)
+
+print(f"Analizando {len(valid_eeg)} canales cerebrales...")
+print(f"{'Canal':<10} | {'ATT (µV)':<10} | {'INAT (µV)':<10} | {'p-value':<10}")
+print("-" * 55)
+
+winners = []
+for ch in valid_eeg:
+    # Obtenemos datos (MNE: Voltios -> µV)
+    data_att = ep_crop[gd_att].get_data(picks=ch).mean(axis=2).flatten() * 1e6
+    data_inat = ep_crop[gd_inat].get_data(picks=ch).mean(axis=2).flatten() * 1e6
+    
+    # Test: ¿Es ATT > INAT?
+    t, p = stats.ttest_ind(data_att, data_inat, alternative='greater')
+    
+    if p < 0.05:
+        print(f"{ch:<10} | {np.mean(data_att):>10.2f} | {np.mean(data_inat):>10.2f} | {p:>10.4f} !!!")
+        winners.append(ch)
+
+print(f"\nROI Sugerida para P3b en este sujeto: {winners}")
