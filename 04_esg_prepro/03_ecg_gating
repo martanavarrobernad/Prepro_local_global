@@ -1,0 +1,85 @@
+# -*- coding: utf-8 -*-
+"""
+PASO 2 CORREGIDO: DETECCIÓN -> EPOCHING -> GATING -> FILTRADO ÉPOCAS
+Orden óptimo para evitar artefactos de filtro y maximizar detección de ECG.
+"""
+
+from pathlib import Path
+import mne
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import gc
+
+# ==== CONFIGURACIÓN ====
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg")
+INPUT_FILES = list(SUBJECT_DIR.glob("*_RefTH6.fif"))
+OUT_DIR = SUBJECT_DIR / "PROMEDIOS_FINALES"
+OUT_DIR.mkdir(exist_ok=True)
+
+TMIN, TMAX = -0.010, 0.040 
+BASELINE = (-0.010, -0.002)
+
+def main():
+    stats = []
+
+    for f_path in INPUT_FILES:
+        print(f"\n--- PROCESANDO: {f_path.name} ---")
+        # 1. Cargar raw re-referenciado (SIN FILTRAR A 50HZ)
+        raw = mne.io.read_raw_fif(f_path, preload=True, verbose=False)
+        sfreq = raw.info['sfreq']
+
+        # 2. Detectar R-peaks (Señal limpia para el algoritmo)
+        ecg_events, _, _ = mne.preprocessing.find_ecg_events(raw, ch_name='ECG', 
+                                                           l_freq=5, h_freq=35, verbose=False)
+        r_peak_times = ecg_events[:, 0] / sfreq
+
+        # 3. Epocaje (Sobre señal SIN filtrar a 50Hz)
+        events, event_id = mne.events_from_annotations(raw, verbose=False)
+        stim_codes = [v for k, v in event_id.items() if "Stimulus" in k]
+        epochs = mne.Epochs(raw, events, event_id=stim_codes, tmin=TMIN, tmax=TMAX, 
+                            baseline=None, preload=True, verbose=False) # Baseline después del filtro
+
+        # 4. ECG GATING (Eliminar épocas que coinciden con el latido)
+        n_original = len(epochs)
+        epoch_onsets = epochs.events[:, 0] / sfreq
+        bad_indices = [i for i, t_onset in enumerate(epoch_onsets) 
+                       if np.any(np.abs(r_peak_times - t_onset) < 0.150)]
+        
+        epochs.drop(bad_indices, reason='ECG_GATING')
+        n_final = len(epochs)
+
+        # 5. FILTRADO DE ÉPOCAS (Solo las que han sobrevivido)
+        # Aplicamos el filtro de 50-800 Hz ahora
+        print(f"  -> Filtrando {n_final} épocas (50-800 Hz)...")
+        epochs.filter(l_freq=50.0, h_freq=800.0, verbose=False)
+        
+        # Aplicamos baseline ahora que la señal está filtrada
+        epochs.apply_baseline(BASELINE, verbose=False)
+
+        # Estadísticas para el reporte
+        n_dropped = n_original - n_final
+        stats.append({
+            'Run': f_path.stem,
+            'Total_Original': n_original,
+            'Eliminadas': n_dropped,
+            'Porcentaje_Rechazo': round((n_dropped / n_original) * 100, 2)
+        })
+        # 6. Guardar Promedios
+        evoked_list = []
+        for cond in epochs.event_id:
+            # Creamos el promedio para cada trigger
+            ev = epochs[cond].average()
+            
+            # ASIGNACIÓN CORRECTA DEL COMENTARIO:
+            # Esto es lo que permite que luego el Grand Average sepa qué trigger es cada uno
+            ev.comment = cond 
+            
+            evoked_list.append(ev)
+            
+        # Guardar el archivo con todos los evokeds del run
+        out_name = OUT_DIR / f"{f_path.stem}_Gated_Evoked.fif"
+        mne.write_evokeds(out_name, evoked_list, overwrite=True)
+
+if __name__ == "__main__":
+    main()
