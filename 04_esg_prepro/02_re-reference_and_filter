@@ -34,19 +34,14 @@ def main():
             print(f"  -> Re-referenciando a {REF_CHANNEL}...")
             raw.set_eeg_reference(ref_channels=REF_CHANNEL, verbose=False)
         else:
-            print(f"  ⚠️ No se encontró {REF_CHANNEL} en este archivo.")
-
-        # 3. FILTRADO (Protocolo Gabrieli: 50-800 Hz)
-        # Este filtro ya va a empezar a atenuar el ECG antes de detectar los R-peaks
-        print("  -> Aplicando filtro 50-800 Hz...")
-        raw.filter(l_freq=50.0, h_freq=800.0, fir_design='firwin', phase='zero', verbose=False)
+            print(f"  No se encontró {REF_CHANNEL} en este archivo.")
         
         # 4. GUARDAR ESTADO INTERMEDIO
         # Guardamos con un sufijo nuevo para que tu siguiente script (R-peaks) lo tome de aquí
-        out_name = SUBJECT_DIR / f"{f_path.stem}_RefTH6_Filt.fif"
+        out_name = SUBJECT_DIR / f"{f_path.stem}_RefTH6.fif"
         raw.save(out_name, overwrite=True, verbose=False)
         
-        print(f"  ✅ Guardado: {out_name.name}")
+        print(f"  Guardado: {out_name.name}")
         
         del raw
         gc.collect()
