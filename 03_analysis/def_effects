@@ -1,0 +1,130 @@
+import mne
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+
+# Activar modo interactivo para zoom y navegación
+try:
+    matplotlib.use('Qt5Agg')
+except:
+    pass
+
+# =============================================================================
+# 1. CARGA DE DATOS (Generados en tu Step 4)
+# =============================================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\eeg\eeg")
+INPUT_FILENAME = "sub-001_FINAL_concatenated_epo.fif"
+
+# Definimos los ROIs basados en tu montaje
+ROI_LOCAL = ['Fz', 'FCz', 'Cz', 'F1', 'F2', 'FC1', 'FC2']
+ROI_P3B = ['Pz', 'CPz', 'POz', 'P1', 'P2', 'CP1', 'CP2']
+
+epochs = mne.read_epochs(SUBJECT_DIR / INPUT_FILENAME, preload=True)
+
+# Ajustamos el tiempo de 0 a 800ms como pediste para que sea más claro
+epochs.crop(tmin=0.0, tmax=0.8)
+
+# =============================================================================
+# 2. FUNCIÓN DE VISUALIZACIÓN PROFESIONAL
+# =============================================================================
+def plot_clean_erp(epochs, query_att, query_inat, roi, title):
+    """
+    Usa la jerarquía de tus etiquetas (Attentive/Inattentive) para graficar.
+    Calcula Media, SD (Sombreado claro) y 95% CI (Sombreado oscuro).
+    """
+    plt.figure(figsize=(12, 6))
+    times = epochs.times * 1000
+    
+    # Extraemos datos promediando canales del ROI primero (trials, tiempo)
+    # Gracias a tu EVENT_ID, 'Attentive/LD' ya incluye GS/LD y GD/LD
+    data_att = epochs[query_att].get_data(picks=roi).mean(axis=1) * 1e6
+    data_inat = epochs[query_inat].get_data(picks=roi).mean(axis=1) * 1e6
+    
+    datasets = [
+        (data_att, 'Atento', '#0072B2'),   # Azul
+        (data_inat, 'Inatento', '#D55E00') # Naranja/Rojo
+    ]
+
+    for data, label, color in datasets:
+        mean = data.mean(axis=0)
+        std = data.std(axis=0)
+        ci = 1.96 * (std / np.sqrt(len(data))) # Intervalo de Confianza 95%
+
+        # Dibujar
+        plt.plot(times, mean, label=f"{label} (N={len(data)})", color=color, lw=2.5)
+        plt.fill_between(times, mean - std, mean + std, color=color, alpha=0.1) # SD
+        plt.fill_between(times, mean - ci, mean + ci, color=color, alpha=0.3)   # 95% CI
+
+    plt.axvline(0, color='black', lw=1.5)
+    plt.axhline(0, color='black', lw=0.8, ls='--')
+    plt.xlim(0, 800)
+    plt.title(title, fontsize=14, fontweight='bold', pad=20)
+    plt.xlabel('Tiempo (ms)', fontsize=12)
+    plt.ylabel('Amplitud (µV)', fontsize=12)
+    plt.legend(loc='best', frameon=True, shadow=True)
+    plt.grid(True, linestyle=':', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+# =============================================================================
+# 3. LANZAR COMPARACIONES (Usando tus etiquetas del Step 4)
+# =============================================================================
+
+# Comparación 1: EFECTO LOCAL PURO (Detección automática del cambio)
+# ROI Frontal para ver la MMN (150-250ms)
+plot_clean_erp(epochs, 'Attentive/LD', 'Inattentive/LD', ROI_LOCAL, 
+               "EFECTO LOCAL (MMN/P3a): Todos los Local Deviants")
+
+# Comparación 2: EFECTO GLOBAL PURO (Detección consciente del patrón)
+# ROI Parietal para ver la P3b (400-600ms)
+plot_clean_erp(epochs, 'Attentive/GD', 'Inattentive/GD', ROI_P3B, 
+               "EFECTO GLOBAL (P3b): Todos los Global Deviants")
+
+# =============================================================================
+# 4. ESTADÍSTICAS BLINDADAS POR VENTANA (MMN y P3b)
+# =============================================================================
+print("\n" + "="*60)
+print("  ESTADÍSTICAS RESTRINGIDAS A VENTANAS DE INTERÉS")
+print("="*60)
+print(f"{'COMPONENTE':15} | {'ESTADO':12} | {'AMP MEDIA':10} | {'LAT. PICO'}")
+print("-" * 60)
+
+# Definimos las ventanas estrictas
+analisis = [
+    ('Local (MMN)',  'LD', 0.150, 0.250, ROI_LOCAL), # Ventana MMN
+    ('Global (P3b)', 'GD', 0.400, 0.600, ROI_P3B)   # Ventana P3b
+]
+
+for nombre, tag, v_tmin, v_tmax, roi in analisis:
+    for state in ['Attentive', 'Inattentive']:
+        query = f"{state}/{tag}"
+        
+        # Seleccionamos los epochs de la condición
+        sel_epochs = epochs[query]
+        
+        if len(sel_epochs) == 0:
+            continue
+
+        # 1. Amplitud Media (Promedio de todos los puntos en la ventana)
+        amp_media = sel_epochs.get_data(picks=roi, tmin=v_tmin, tmax=v_tmax).mean() * 1e6
+        
+        # 2. Latencia del Pico (Buscamos el máximo voltaje DENTRO de la ventana)
+        # Extraemos el promedio del ROI para esta condición
+        roi_data = sel_epochs.get_data(picks=roi).mean(axis=(0, 1))
+        
+        # Buscamos los índices que corresponden solo a la ventana v_tmin - v_tmax
+        times = epochs.times
+        mask = (times >= v_tmin) & (times <= v_tmax)
+        
+        ventana_data = roi_data[mask]
+        ventana_times = times[mask]
+        
+        # Encontramos el pico (usamos valor absoluto por si la MMN es negativa)
+        idx_pico = np.argmax(np.abs(ventana_data))
+        lat_pico = ventana_times[idx_pico] * 1000
+        amp_pico = ventana_data[idx_pico] * 1e6
+        
+        print(f"{nombre:15} | {state:12} | {amp_media:6.2f} µV | {lat_pico:4.0f} ms (Pico: {amp_pico:5.2f}µV)")
+
+print("="*60)
