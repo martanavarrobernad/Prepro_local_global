@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+Created on Thu Feb 19 16:07:13 2026
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
 STEP 4: SCRIPT FINAL - FLUJO COMPLETO Y CORRECTO
 ------------------------------------------------
 1. Carga (Interpolando canales malos del CSV).
@@ -30,28 +37,31 @@ GLOBAL_ICA_PATH = SUBJECT_DIR / "GLOBAL_ica.fif"
 DATA_SUFFIX = "_Step2_Inspected.vhdr" 
 OUTPUT_FILENAME = "sub-001_FINAL_concatenated_epo.fif"
 
-L_FREQ, H_FREQ = 0.1, 30.0    
-TMIN, TMAX = -0.2, 0.8        
+# --- NUEVOS PARÁMETROS DE ÉPOCAS ---
+L_FREQ, H_FREQ = 0.1, 30.0  
+TMIN, TMAX = -0.8, 0.8         # De -800ms a 800ms
+BASELINE = (-0.8, 0.0)         # Baseline de -800ms a 0ms       
 MONTAJE_GORRO = 'easycap-M1'
 
-TRIGGER_MAP = {
-    # === SESIÓN ATTENTIVE (Contar Sonidos) ===
-    '69':  'LSGS_ATT', '133': 'LSGS_ATT',  # Local Std, Global Std
-    '149': 'LSGD_ATT', '85':  'LSGD_ATT',  # Local Std, Global Dev
-    '141': 'LDGS_ATT', '77':  'LDGS_ATT',  # Local Dev, Global Std
-    '157': 'LDGD_ATT', '93':  'LDGD_ATT',  # Local Dev, Global Dev
-
-    # === SESIÓN INATTENTIVE (Contar Letras) ===
-    '101': 'LSGS_INAT', '165': 'LSGS_INAT', 
-    '181': 'LSGD_INAT', '117': 'LSGD_INAT', 
-    '173': 'LDGS_INAT', '109': 'LDGS_INAT', 
-    '189': 'LDGD_INAT', '125': 'LDGD_INAT'
+# --- ETIQUETADO JERÁRQUICO (Atención/Local/Global) ---
+# Usamos '/' para que MNE permita filtrar por categorías (ej: epochs['Attentive'])
+EVENT_ID = {
+    'Attentive/LS/GS': 10, 'Attentive/LS/GD': 11, 
+    'Attentive/LD/GS': 12, 'Attentive/LD/GD': 13,
+    'Inattentive/LS/GS': 20, 'Inattentive/LS/GD': 21, 
+    'Inattentive/LD/GS': 22, 'Inattentive/LD/GD': 23
 }
 
-# IDs numéricos únicos para MNE
-EVENT_ID = {
-    'LSGS_ATT': 10, 'LSGD_ATT': 11, 'LDGS_ATT': 12, 'LDGD_ATT': 13,
-    'LSGS_INAT': 20, 'LSGD_INAT': 21, 'LDGS_INAT': 22, 'LDGD_INAT': 23
+# Mapa de triggers originales a nuestras nuevas etiquetas
+TRIGGER_MAP = {
+    '69':  'Attentive/LS/GS', '133': 'Attentive/LS/GS',
+    '149': 'Attentive/LS/GD', '85':  'Attentive/LS/GD',
+    '141': 'Attentive/LD/GS', '77':  'Attentive/LD/GS',
+    '157': 'Attentive/LD/GD', '93':  'Attentive/LD/GD',
+    '101': 'Inattentive/LS/GS', '165': 'Inattentive/LS/GS', 
+    '181': 'Inattentive/LS/GD', '117': 'Inattentive/LS/GD', 
+    '173': 'Inattentive/LD/GS', '109': 'Inattentive/LD/GS', 
+    '189': 'Inattentive/LD/GD', '125': 'Inattentive/LD/GD'
 }
 
 EXPECTED_EEG = [
@@ -183,24 +193,51 @@ while True:
         ica.exclude = [] 
 
 # =============================================================================
-# 4. FINAL: APLICAR Y LIMPIAR EPOCHS
+# 4. APLICACIÓN, FILTRO Y LIMPIEZA FINAL
 # =============================================================================
-print("\n[PROCESO] Aplicando ICA y Filtrando...")
+print("\n[PROCESO] Aplicando ICA y Filtro...")
 ica.apply(raw_global)
 raw_global.filter(L_FREQ, H_FREQ, verbose=False)
 
-print("[PROCESO] Creando Epochs...")
+print(f"[PROCESO] Creando Epochs ({TMIN} a {TMAX}s)...")
 epochs = mne.Epochs(raw_global, events_global, event_id=EVENT_ID,
-                    tmin=TMIN, tmax=TMAX, baseline=(TMIN, 0), preload=True, verbose=False)
+                    tmin=TMIN, tmax=TMAX, baseline=BASELINE, 
+                    preload=True, verbose=False)
 
 print("\n" + "!"*60)
-print("   4. LIMPIEZA FINAL DE EPOCHS")
-print("   Haz clic en los trials feos para borrarlos y cierra.")
+print("    4. LIMPIEZA FINAL DE EPOCHS")
+print("    Haz clic en los trials feos para borrarlos y cierra.")
 print("!"*60)
 
-epochs.plot(n_epochs=5, n_channels=len(EXPECTED_EEG), scalings='auto', title="4. LIMPIEZA MANUAL FINAL")
-plt.show(block=True)
+# n_channels=len(EXPECTED_EEG) para ver todos los canales en una sola vista
+epochs.plot(n_epochs=5, n_channels=len(EXPECTED_EEG), scalings='auto', 
+            title="4. LIMPIEZA MANUAL FINAL", block=True)
 
+# =============================================================================
+# 4. FINAL: CÁLCULO DE EFECTOS PARA VERIFICACIÓN Y GUARDADO
+# =============================================================================
+
+# --- EFECTO LOCAL (LD - LS) ---
+local_att = mne.combine_evoked([epochs['Attentive/LD'].average(), 
+                                epochs['Attentive/LS'].average()], weights=[1, -1])
+
+local_inat = mne.combine_evoked([epochs['Inattentive/LD'].average(), 
+                                 epochs['Inattentive/LS'].average()], weights=[1, -1])
+
+# --- EFECTO GLOBAL (GD - GS) ---  <-- ESTO ES LO QUE FALTA
+global_att = mne.combine_evoked([epochs['Attentive/GD'].average(), 
+                                 epochs['Attentive/GS'].average()], weights=[1, -1])
+
+global_inat = mne.combine_evoked([epochs['Inattentive/GD'].average(), 
+                                  epochs['Inattentive/GS'].average()], weights=[1, -1])
+
+# --- PRINTS DE VERIFICACIÓN ---
+print(f"\n[INFO] Efecto Local Atento: {len(epochs['Attentive/LD'])} trials Deviant.")
+print(f"[INFO] Efecto Local Inatento: {len(epochs['Inattentive/LD'])} trials Deviant.")
+print(f"[INFO] Efecto Global Atento: {len(epochs['Attentive/GD'])} trials Deviant.")
+print(f"[INFO] Efecto Global Inatento: {len(epochs['Inattentive/GD'])} trials Deviant.")
+
+# Guardar el archivo final con todos los epochs y sus etiquetas
 out_file = SUBJECT_DIR / OUTPUT_FILENAME
 epochs.save(out_file, overwrite=True)
-print(f"\n✅ GUARDADO: {out_file.name}")
+print(f"\n✅ GUARDADO EXITOSO: {out_file.name}")
